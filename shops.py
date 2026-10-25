@@ -1,8 +1,13 @@
-"""Shop-Liste. Drei Abfragearten:
+"""Shop-Liste. Abfragearten:
 
-- shopify:  Shopify-Suche (/search/suggest.json), liefert Preis + Verfügbarkeit direkt
-- jsonld:   Suchseite mit schema.org-Produktdaten; fehlt die Verfügbarkeit, wird die Produktseite geprüft
-- links:    Kategorie-/Suchseite → Produktlinks einsammeln → jede Produktseite prüfen
+- shopify:  Shopify-Suche (/search/suggest.json), liefert Preis + Verfügbarkeit direkt.
+            Gesucht wird mit den Begriffen aus „queries" + den Standard-Suchen aus catalog.py
+            + den eigenen Telegram-Suchen (/suche). → findet ALLE Produkttypen.
+- jsonld:   Suchseite mit schema.org-Produktdaten. Mit „search_url" (Platzhalter {q}) wie Shopify
+            mit allen Suchbegriffen, sonst nur die feste „url".
+- lidl:     Lidl-Such-API, Suchbegriffe wie Shopify.
+- links:    feste Kategorie-/Suchseite → Produktlinks nach Muster einsammeln → jede Produktseite prüfen.
+            ACHTUNG: Diese Shops finden weiterhin nur, was ihr Muster erlaubt (meist nur „30 Jahre").
 
 Regionen (Umgebungsvariable REGION): AT = nur Österreich, DACH = AT + DE + CH,
 EU = DACH + Shops aus NL, BE, FR, IT, ES, PT, FI.
@@ -37,10 +42,12 @@ SHOPS_DE = [
     #  "url": "https://www.mediamarkt.de/de/search.html?query=pokemon%2030%20jahre"},
     # {"name": "Saturn", "type": "jsonld", "base": "https://www.saturn.de",
     #  "url": "https://www.saturn.de/de/search.html?query=pokemon%2030%20jahre"},
+    # Müller lädt Suchergebnisse evtl. per JavaScript nach → im Shop-Test oft „0". Nicht darauf verlassen.
     {"name": "Müller", "type": "jsonld", "base": "https://www.mueller.de",
-     "url": "https://www.mueller.de/search/?q=pokemon+30+jahre+sammelkarten"},
-    {"name": "Otto", "type": "jsonld", "base": "https://www.otto.de",
-     "url": "https://www.otto.de/suche/pokemon%2030%20jahre/"},
+     "search_url": "https://www.mueller.de/search/?q={q}", "queries": ["pokemon 30 jahre sammelkarten"]},
+    # Otto: lehnt Abfragen von GitHub-Servern ab (HTTP 400 im Shop-Test 25.10.2026) – daher aus.
+    # {"name": "Otto", "type": "jsonld", "base": "https://www.otto.de",
+    #  "url": "https://www.otto.de/suche/pokemon%2030%20jahre/"},
     {"name": "Lidl", "type": "lidl", "base": "https://www.lidl.de",
      "queries": ["pokemon 30 jahre", "pokemon sammelkarten"]},
     {"name": "EDEKA24", "type": "links", "base": "https://www.edeka24.de",
@@ -53,9 +60,10 @@ SHOPS_DE = [
     {"name": "Toys-for-Fun", "type": "links", "base": "https://www.toys-for-fun.com",
      "url": "https://www.toys-for-fun.com/de/catalogsearch/result/?q=pokemon+30+jahre",
      "link_pattern": r'href="(https://www\.toys-for-fun\.com/de/pokemon-[a-z0-9-]*30-jahre[a-z0-9-]*\.html)"'},
-    {"name": "Rofu", "type": "links", "base": "https://www.rofu.de",
-     "url": "https://www.rofu.de/suche?searchPhrase=pokemon+30+jahre",
-     "link_pattern": r'"url":"(https://www\.rofu\.de/[a-z0-9-]*\.html)"'},
+    # Rofu: Suchadresse existiert nicht mehr (HTTP 404 im Shop-Test 25.10.2026) – daher aus.
+    # {"name": "Rofu", "type": "links", "base": "https://www.rofu.de",
+    #  "url": "https://www.rofu.de/suche?searchPhrase=pokemon+30+jahre",
+    #  "link_pattern": r'"url":"(https://www\.rofu\.de/[a-z0-9-]*\.html)"'},
 
     # Weitere TCG-Shops (Shopify)
     {"name": "Cardcosmos", "type": "shopify", "base": "https://cardcosmos.de", "queries": ["30 jahre", "30 jahre top trainer", "30 jahre mini tin"]},
@@ -121,7 +129,7 @@ SHOPS_AT = [
     {"name": "Pokevend", "type": "shopify", "base": "https://pokevend.at", "queries": ["30 jahre"]},
     {"name": "MistiCards", "type": "shopify", "base": "https://misticards.com", "queries": ["30 jahre"]},
     {"name": "Müller AT", "type": "jsonld", "base": "https://www.mueller.at",
-     "url": "https://www.mueller.at/search/?q=pokemon+30+jahre+sammelkarten"},
+     "search_url": "https://www.mueller.at/search/?q={q}", "queries": ["pokemon 30 jahre sammelkarten"]},
     {"name": "Lidl AT", "type": "lidl", "base": "https://www.lidl.at", "assortment": "AT", "locale": "de_AT",
      "queries": ["pokemon 30 jahre", "pokemon sammelkarten"]},
     {"name": "Grubi & Co", "type": "links", "every": 540, "base": "https://www.grubi-co.at",

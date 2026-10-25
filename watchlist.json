@@ -1,0 +1,11 @@
+{
+ "types": [
+  "ttb",
+  "upc",
+  "bundle",
+  "display"
+ ],
+ "type_max": {},
+ "searches": [],
+ "update_offset": 0
+}

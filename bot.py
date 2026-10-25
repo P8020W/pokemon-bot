@@ -1,7 +1,8 @@
-"""Pokémon-30-Jahre-Restock-Bot.
+"""Pokémon-Restock-Bot.
 
 Prüft alle Shops aus shops.py, ordnet die Treffer dem Katalog zu und schickt einen
-Telegram-Ping, sobald ein Produkt lieferbar ist UND höchstens UVP + Aufschlag kostet.
+Telegram-Ping, sobald ein gesuchtes Produkt lieferbar ist UND höchstens die Preisgrenze kostet.
+Was gesucht wird, steht in watchlist.json und lässt sich per Telegram-Befehl ändern (watchlist.py).
 Gepingt wird nur beim Wechsel „nicht kaufbar → kaufbar", nicht bei jedem Lauf.
 
 Umgebungsvariablen:
@@ -28,14 +29,16 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from catalog import NAMES, UVP, classify
+import tg
+import watchlist
+from catalog import CATALOG_VERSION, NAMES, SEARCH_QUERIES, classify, is_pokemon, is_relevant, languages, \
+    matches_search, uvp_for
 from shops import FLAGS, select_shops
 
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/141.0 Safari/537.36")
 AUFSCHLAG = float(os.environ.get("MAX_AUFSCHLAG_PROZENT", "10")) / 100
 STATE_FILE = os.environ.get("STATE_FILE", os.path.join(os.path.dirname(__file__), "state.json"))
-DRY_RUN = os.environ.get("DRY_RUN") == "1"
 TZ = ZoneInfo("Europe/Vienna")
 REGION = os.environ.get("REGION", "AT").strip().upper() or "AT"
 SHOPS = select_shops(REGION)
@@ -66,8 +69,8 @@ def fetch(url: str, accept: str = "text/html") -> str:
         return r.read().decode("utf-8", errors="ignore")
 
 
-def price_limit(key: str) -> float:
-    return round(UVP[key] * (1 + AUFSCHLAG) + 0.01, 2)
+def price_limit(uvp: float) -> float:
+    return round(uvp * (1 + AUFSCHLAG) + 0.01, 2)
 
 
 def to_price(value):
@@ -152,11 +155,27 @@ def parse_detail(page: str, text_check: bool = True):
 
 # ---------- Shop-Abfragen ----------
 
+WATCH = watchlist.default_watchlist()  # wird in main() aus watchlist.json geladen
+
+
+def queries_for(shop):
+    """Suchbegriffe für einen Shop: eigene aus shops.py + Standard-Suchen + eigene Telegram-Suchen."""
+    qs = list(shop.get("queries", []))
+    if shop.get("generic", True):
+        for lang in sorted(languages()):
+            qs += SEARCH_QUERIES.get(lang, [])
+        qs += [s["text"] for s in WATCH["searches"]]
+    return list(dict.fromkeys(q.strip().lower() for q in qs if q.strip()))
+
+
 def offer(shop, title, url, price, available, preorder=False):
     currency = shop.get("currency", "EUR")
+    title = title or ""
+    key = classify(title)
     return {"shop": shop["name"], "land": shop.get("land", "DE"), "title": title,
             "url": urllib.parse.urljoin(shop["base"], url), "price": price, "currency": currency,
-            "available": available, "preorder": preorder, "key": classify(title)}
+            "available": available, "preorder": preorder, "key": key,
+            "uvp": uvp_for(key, title) if key else None}
 
 
 def eur_price(o):
@@ -168,15 +187,17 @@ def eur_price(o):
 
 def check_shopify(shop):
     seen, out = set(), []
-    for q in shop["queries"]:
+    for q in queries_for(shop):
         url = (f"{shop['base']}/search/suggest.json?q={urllib.parse.quote(q)}"
                "&resources[type]=product&resources[limit]=10")
         data = json.loads(fetch(url, "application/json"))
         for p in data["resources"]["results"]["products"]:
-            if p["url"] in seen:
+            u = p["url"].split("?")[0]  # Shopify hängt den Suchbegriff an den Link → sonst Doppel-Pings
+            if u in seen:
                 continue
-            seen.add(p["url"])
-            out.append(offer(shop, p["title"], p["url"].split("?")[0], to_price(p.get("price")), bool(p.get("available"))))
+            seen.add(u)
+            out.append(offer(shop, p["title"], u, to_price(p.get("price")), bool(p.get("available"))))
+        time.sleep(0.3)
     return out
 
 
@@ -206,15 +227,22 @@ def check_links(shop):
 
 
 def check_jsonld(shop):
-    out = []
-    for p in jsonld_products(fetch(shop["url"])):
-        title = p.get("name") or ""
-        price, av = offer_of(p)
-        ok, pre = availability_of(av)
-        out.append(offer(shop, html.unescape(title), p.get("url") or "", price, ok, pre))
+    out, seen = [], set()
+    urls = ([shop["search_url"].format(q=urllib.parse.quote_plus(q)) for q in queries_for(shop)]
+            if shop.get("search_url") else [shop["url"]])
+    for page_url in urls:
+        for p in jsonld_products(fetch(page_url)):
+            title = html.unescape(p.get("name") or "")
+            link = p.get("url") or ""
+            if (link or title) in seen:
+                continue
+            seen.add(link or title)
+            price, av = offer_of(p)
+            ok, pre = availability_of(av)
+            out.append(offer(shop, title, link, price, ok, pre))
     # Unbekannte Verfügbarkeit nur bei preislich interessanten Treffern auf der Produktseite nachprüfen
-    todo = [o for o in out if o["available"] is None and o["key"] and o["price"] and eur_price(o) <= price_limit(o["key"])]
-    for o in todo:
+    todo = [o for o in out if o["available"] is None and target(o) and o["price"] and within_limit(o)]
+    for o in todo[:10]:
         try:
             _, pr, ok, pre = parse_detail(fetch(o["url"]), shop.get("text_check", True))
             o["available"], o["preorder"] = ok, pre
@@ -226,7 +254,7 @@ def check_jsonld(shop):
 
 def check_lidl(shop):
     out, seen = [], set()
-    for q in shop["queries"]:
+    for q in queries_for(shop):
         url = (f"{shop['base']}/q/api/search?assortment={shop.get('assortment', 'DE')}"
                f"&locale={shop.get('locale', 'de_DE')}&version=v2.0.0&fetchsize=48&q=" + urllib.parse.quote(q))
         for item in json.loads(fetch(url, "*/*")).get("items", []):  # Lidl antwortet auf application/json mit 401
@@ -246,13 +274,39 @@ def check_lidl(shop):
 CHECKERS = {"shopify": check_shopify, "links": check_links, "jsonld": check_jsonld, "lidl": check_lidl}
 
 
-# ---------- Bewertung, Zustand, Telegram ----------
+# ---------- Was wird gesucht, was ist kaufbar ----------
+
+def target(o):
+    """Passt das Angebot zu etwas, das gesucht wird? → (Bezeichnung, Preisgrenze oder None) bzw. None.
+
+    Eigene Suchen (/suche) haben Vorrang vor den Produkttypen.
+    """
+    if not is_relevant(o["title"]):
+        return None
+    for s in WATCH["searches"]:
+        if matches_search(o["title"], s["text"]) and (o["key"] or is_pokemon(o["title"])):
+            limit = s.get("max") or (price_limit(o["uvp"]) if o["uvp"] else None)
+            return "🔎 " + s["text"], limit
+    if o["key"] and o["key"] in WATCH["types"]:
+        own = WATCH["type_max"].get(o["key"])
+        return NAMES[o["key"]], own or price_limit(o["uvp"])
+    return None
+
+
+def within_limit(o) -> bool:
+    t = target(o)
+    if not t or o["price"] is None:
+        return False
+    limit = t[1]
+    price = eur_price(o)
+    # Viel zu billig = falsch zugeordnet (z. B. Einzelkarte statt Box)
+    if o["uvp"] and price < o["uvp"] * 0.4:
+        return False
+    return limit is None or price <= limit
+
 
 def is_buyable(o) -> bool:
-    if not o["key"] or not o["available"] or o["price"] is None:
-        return False
-    # Viel zu billig = falsch zugeordnet (z. B. Einzelkarte statt Box)
-    return UVP[o["key"]] * 0.4 <= eur_price(o) <= price_limit(o["key"])
+    return bool(o["available"]) and within_limit(o)
 
 
 def load_state():
@@ -268,36 +322,66 @@ def save_state(state):
         json.dump(state, f, ensure_ascii=False, indent=1)
 
 
-def telegram(text: str):
-    token, chat = os.environ.get("TELEGRAM_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
-    if DRY_RUN or not token or not chat:
-        print("---- (nicht gesendet) ----\n" + text + "\n")
-        return
-    body = urllib.parse.urlencode({"chat_id": chat, "text": text, "parse_mode": "HTML",
-                                   "disable_web_page_preview": "true"}).encode()
-    urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", body, timeout=20).read()
-
-
 def fmt_offer(o) -> str:
-    uvp = UVP[o["key"]]
+    label = target(o)[0]
     tag = " · Vorbestellung" if o["preorder"] else ""
     flag = FLAGS.get(o.get("land", "DE"), "")
     if o.get("currency") == "CHF":
         preis = f"CHF {o['price']:.2f}"
-        rel = f"≈ {eur_price(o):.2f} € auf €-UVP-Skala"
-    else:
-        diff = o["price"] - uvp
+        rel = f"≈ {eur_price(o):.2f} € auf €-Skala"
+    elif o["uvp"]:
+        diff = o["price"] - o["uvp"]
         preis = f"{o['price']:.2f} €"
-        rel = "zur UVP" if abs(diff) < 0.5 else f"{diff:+.2f} € ggü. UVP"
-    return (f"<b>{html.escape(NAMES[o['key']])}</b>\n"
-            f"🛒 {flag} {html.escape(o['shop'])}: <b>{preis}</b> ({rel}, UVP {uvp:.2f} €){tag}\n"
+        rel = "zur UVP" if abs(diff) < 0.5 else f"{diff:+.2f} € ggü. UVP {o['uvp']:.2f} €"
+    else:
+        preis, rel = f"{o['price']:.2f} €", "UVP unbekannt"
+    return (f"<b>{html.escape(label)}</b>\n"
+            f"🛒 {flag} {html.escape(o['shop'])}: <b>{preis}</b> ({rel}){tag}\n"
             f"{html.escape(o['title'])}\n"
             f"👉 {html.escape(o['url'])}")
 
 
+SEND_FAILURES = []  # Telegram-Fehler sammeln; am Ende wird der Lauf rot, statt mittendrin abzubrechen
+
+
+def safe_send(text: str) -> bool:
+    try:
+        tg.send(text)
+        return True
+    except SystemExit:
+        raise  # Token/Chat-ID fehlen ganz → sofort rot
+    except Exception as e:  # noqa: BLE001
+        SEND_FAILURES.append(str(e)[:200])
+        print(f"Telegram-Fehler: {e}", file=sys.stderr)
+        return False
+
+
+def send_alerts(alerts):
+    """Bis zu 5 Treffer einzeln, mehr als Sammelnachricht. Gibt die Links zurück, die NICHT ankamen."""
+    failed = set()
+    if len(alerts) <= 5:
+        for o in alerts:
+            if not safe_send("🚨 <b>Jetzt bestellbar!</b>\n\n" + fmt_offer(o)):
+                failed.add(o["url"])
+        return failed
+    chunk, members = f"🚨 <b>{len(alerts)} Angebote jetzt bestellbar</b>\n", []
+    for o in alerts:
+        part = "\n\n" + fmt_offer(o)
+        if len(chunk) + len(part) > 3900:
+            if not safe_send(chunk):
+                failed.update(members)
+            chunk, members = "🚨 <b>Fortsetzung</b>", []
+        chunk += part
+        members.append(o["url"])
+    if not safe_send(chunk):
+        failed.update(members)
+    return failed
+
+
 def shop_interval(shop) -> float:
-    # Shops, bei denen jede Produktseite einzeln abgerufen wird, seltener fragen (sonst droht Sperre)
-    return shop.get("every", 540 if shop["type"] == "links" else 0)
+    # Seltener fragen, wo viele Abrufe nötig sind (sonst droht Sperre):
+    # Produktseiten einzeln (links) und Shopify mit mehreren Suchbegriffen alle 9 Min.
+    return shop.get("every", 540 if shop["type"] in ("links", "shopify") else 0)
 
 
 def run_once(state):
@@ -313,8 +397,8 @@ def run_once(state):
         try:
             res = CHECKERS[shop["type"]](shop)
             found += res
-            hits = sum(1 for o in res if o["key"])
-            print(f"{shop['name']:20} {len(res):3} Treffer, {hits:2} zugeordnet")
+            hits = sum(1 for o in res if target(o))
+            print(f"{shop['name']:20} {len(res):3} Treffer, {hits:2} gesucht")
         except Exception as e:  # noqa: BLE001
             errors[shop["name"]] = str(e)[:200]
             print(f"{shop['name']:20} FEHLER: {e}", file=sys.stderr)
@@ -324,23 +408,41 @@ def run_once(state):
         if name in state.get("errors", {}):
             errors[name] = state["errors"][name]["msg"]
 
+    # Neue Katalogversion: einmal still durchlaufen, damit nicht alles Lieferbare auf einmal gemeldet wird
+    silent = state.get("catalog_version") != CATALOG_VERSION
+
     new_alerts, current = [], {}
     # Angebote von Shops, die gerade nicht antworten oder diesmal übersprungen wurden, behalten –
     # sonst gäbe es beim nächsten Abruf einen doppelten Ping
+    seen_urls = {o["url"] for o in found}
     for url, v in state["offers"].items():
         if v["shop"] in errors or v["shop"] in skipped:
             current[url] = v
+        elif url not in seen_urls and v.get("miss", 0) < 2:
+            # Kurz verschwunden (Ladefehler, Captcha)? Noch 2 Durchgänge merken, sonst Doppel-Ping
+            current[url] = dict(v, miss=v.get("miss", 0) + 1)
     for o in found:
-        if not is_buyable(o):
+        if not is_buyable(o) or o["url"] in current:  # gleicher Link doppelt im Ergebnis
             continue
-        current[o["url"]] = {"price": o["price"], "key": o["key"], "shop": o["shop"], "title": o["title"],
+        label = target(o)[0]
+        current[o["url"]] = {"price": o["price"], "label": label, "shop": o["shop"], "title": o["title"],
                              "currency": o.get("currency", "EUR")}
         before = state["offers"].get(o["url"])
-        if before is None or o["price"] < before["price"] - 0.5:
+        if before is None or o["price"] < before["price"] - 0.5 or before.get("label") != label:
             new_alerts.append(o)
 
-    for o in new_alerts:
-        telegram("🚨 <b>Jetzt bestellbar!</b>\n\n" + fmt_offer(o))
+    if silent:
+        if new_alerts:
+            safe_send(f"ℹ️ Erkennung aktualisiert: {len(new_alerts)} Angebote sind gerade schon lieferbar. "
+                      "Die melde ich nicht einzeln – ab jetzt kommen nur neue. Übersicht morgen um 9 Uhr.")
+        state["catalog_version"] = CATALOG_VERSION
+    else:
+        for url in send_alerts(new_alerts):
+            # Nicht angekommen → beim nächsten Durchgang nochmal versuchen
+            if state["offers"].get(url):
+                current[url] = state["offers"][url]
+            else:
+                current.pop(url, None)
 
     # Shop dauerhaft kaputt? Einmal Bescheid geben, wenn er seit 1 Stunde am Stück nicht antwortet
     prev_err = state.get("errors", {})
@@ -349,8 +451,7 @@ def run_once(state):
         since = prev.get("since") or now.isoformat()
         warned = prev.get("warned", False)
         if not warned and (now - datetime.fromisoformat(since)).total_seconds() >= 3600:
-            telegram(f"⚠️ {html.escape(name)} lässt sich seit ca. 1 Stunde nicht abfragen:\n{html.escape(msg)}")
-            warned = True
+            warned = safe_send(f"⚠️ {html.escape(name)} lässt sich seit ca. 1 Stunde nicht abfragen:\n{html.escape(msg)}")
         errors[name] = {"since": since, "warned": warned, "msg": msg}
 
     # Tägliches Lebenszeichen um 9 Uhr
@@ -358,47 +459,54 @@ def run_once(state):
     if now.hour == 9 and state.get("summary_date") != today:
         lines = [f"☀️ Restock-Bot ({REGION}) läuft. {len(SHOPS) - len(errors)}/{len(SHOPS)} Shops erreichbar."]
         if current:
-            lines.append("\nAktuell zu UVP lieferbar:")
-            lines += [f"• {NAMES[v['key']]} – {v['shop']} {v['price']:.2f} {'CHF' if v.get('currency') == 'CHF' else '€'}"
-                      for v in current.values()]
+            lines.append(f"\nAktuell zu fairen Preisen lieferbar ({len(current)}):")
+            for v in sorted(current.values(), key=lambda v: v.get("label", ""))[:20]:
+                cur = "CHF" if v.get("currency") == "CHF" else "€"
+                lines.append(f"• {html.escape(v.get('label', ''))} – {html.escape(v['shop'])} {v['price']:.2f} {cur}")
+            if len(current) > 20:
+                lines.append(f"… und {len(current) - 20} weitere")
         else:
-            lines.append("Gerade nichts zu fairen Preisen lieferbar.")
-        telegram("\n".join(lines))
-        state["summary_date"] = today
+            lines.append("Gerade nichts Gesuchtes zu fairen Preisen lieferbar.")
+        lines.append("\n/liste zeigt, was ich suche · /hilfe alle Befehle")
+        if safe_send("\n".join(lines)):
+            state["summary_date"] = today
 
     state["offers"], state["errors"], state["last_run"] = current, errors, now.isoformat()
     save_state(state)
-    print(f"\n{now:%H:%M} – {len(SHOPS) - len(skipped)} Shops, {len(found)} Angebote geprüft, {len(current)} kaufbar zu UVP, {len(new_alerts)} neue Pings.\n")
+    print(f"\n{now:%H:%M} – {len(SHOPS) - len(skipped)} Shops, {len(found)} Angebote geprüft, "
+          f"{len(current)} kaufbar, {len(new_alerts)} neu{' (still)' if silent else ''}.\n")
 
 
 def shop_test():
-    """Jeden Shop einmal abfragen und zeigen, ob er antwortet und 30-Jahre-Produkte findet."""
+    """Jeden Shop einmal abfragen und zeigen, ob er antwortet und Gesuchtes findet."""
     ok, leer, kaputt = [], [], []
     for shop in SHOPS:
         try:
             res = CHECKERS[shop["type"]](shop)
-            hits = [o for o in res if o["key"]]
+            hits = [o for o in res if target(o)]
             (ok if hits else leer).append(f"{shop['name']} ({len(hits)})")
-            print(f"OK    {shop['name']:24} {len(res):3} Treffer, {len(hits):2} zugeordnet")
+            print(f"OK    {shop['name']:24} {len(res):3} Treffer, {len(hits):2} gesucht")
         except Exception as e:  # noqa: BLE001
             kaputt.append(f"{shop['name']}: {str(e)[:60]}")
             print(f"FEHLER {shop['name']:24} {e}", file=sys.stderr)
         time.sleep(0.2)
     text = (f"🧪 <b>Shop-Test Region {html.escape(REGION)}</b> – {len(SHOPS)} Shops\n\n"
-            f"✅ Funktioniert ({len(ok)}): {html.escape(', '.join(ok)) or '–'}\n\n"
-            f"🟡 Antwortet, aber nichts gefunden ({len(leer)}): {html.escape(', '.join(leer)) or '–'}\n\n"
+            f"✅ Findet Gesuchtes ({len(ok)}): {html.escape(', '.join(ok)) or '–'}\n\n"
+            f"🟡 Antwortet, aber nichts Gesuchtes ({len(leer)}): {html.escape(', '.join(leer)) or '–'}\n\n"
             f"❌ Nicht erreichbar ({len(kaputt)}):\n" + html.escape("\n".join(kaputt) or "–"))
     if len(text) > 4000:  # Telegram-Limit 4096 Zeichen; kein halbes &amp; stehen lassen
         text = text[:4000]
         if text.rfind("&") > text.rfind(";"):
             text = text[:text.rfind("&")]
         text += " …"
-    telegram(text)
+    tg.send(text)  # Shop-Test: Fehler hier sollen den Lauf rot machen
 
 
 def main():
     """LOOP_MINUTES>0: so lange wiederholt prüfen (alle INTERVAL_SECONDS), sonst genau einmal."""
-    print(f"Region {REGION}: {len(SHOPS)} Shops")
+    global WATCH
+    WATCH = watchlist.load()
+    print(f"Region {REGION}: {len(SHOPS)} Shops · Typen {WATCH['types']} · {len(WATCH['searches'])} eigene Suchen")
     if SHOP_TEST:
         shop_test()
         return
@@ -407,10 +515,27 @@ def main():
     state = load_state()
     while True:
         started = time.time()
+        if commands(WATCH):
+            # Geänderte Suche sofort überall prüfen, nicht erst nach 9 Minuten
+            state["last_checked"] = {}
         run_once(state)
         if time.time() + interval > loop_until:
             break
         time.sleep(max(0, interval - (time.time() - started)))
+    commands(WATCH)
+    if SEND_FAILURES:
+        sys.exit(f"Telegram hat {len(SEND_FAILURES)} Nachricht(en) abgelehnt, zuletzt: {SEND_FAILURES[-1]}")
+
+
+def commands(wl) -> bool:
+    try:
+        return watchlist.process_commands(wl, AUFSCHLAG)
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001
+        SEND_FAILURES.append(f"Befehle: {e}"[:200])
+        print(f"Telegram-Befehle nicht abrufbar: {e}", file=sys.stderr)
+        return False
 
 
 if __name__ == "__main__":
