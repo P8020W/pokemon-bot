@@ -12,24 +12,33 @@ on:
         type: boolean
         default: false
 
+# Shop-Test läuft getrennt, damit er nicht hinter einem 30-Minuten-Lauf warten muss
 concurrency:
-  group: restock-check
+  group: ${{ inputs.shop_test && 'shop-test' || 'restock-check' }}
   cancel-in-progress: false
+
+# Schreibrecht, damit die per Telegram geänderte Suchliste (watchlist.json) gespeichert wird
+permissions:
+  contents: write
 
 jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
+      # Neuesten Stand holen (nicht den vom Startzeitpunkt) – sonst fehlen Änderungen aus dem Lauf davor
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref_name }}
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
       # Zustand (welche Angebote schon gemeldet wurden) zwischen den Läufen merken
       - name: Zustand laden
-        uses: actions/cache/restore@v4
+        if: ${{ !inputs.shop_test }}
+        uses: actions/cache/restore@v5
         with:
           path: state.json
           key: state-${{ github.run_id }}
@@ -49,8 +58,22 @@ jobs:
         run: python bot.py
 
       - name: Zustand speichern
-        if: always()
-        uses: actions/cache/save@v4
+        if: ${{ always() && !inputs.shop_test }}
+        uses: actions/cache/save@v5
         with:
           path: state.json
           key: state-${{ github.run_id }}
+
+      - name: Suchliste speichern
+        if: ${{ always() && !inputs.shop_test }}
+        run: |
+          if [ -n "$(git status --porcelain watchlist.json)" ]; then
+            git config user.name "pokemon-bot"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add watchlist.json
+            git commit -m "Suchliste per Telegram geändert"
+            git pull --rebase
+            git push
+          else
+            echo "Suchliste unverändert"
+          fi
