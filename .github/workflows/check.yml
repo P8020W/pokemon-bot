@@ -1,0 +1,56 @@
+name: Restock-Check
+
+on:
+  schedule:
+    # GitHub startet geplante Läufe nur grob alle 20–30 Min. Darum prüft jeder Lauf
+    # selbst ca. 30 Min. lang alle 3 Min.; der nächste Lauf wartet in der Warteschlange.
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      shop_test:
+        description: "Nur Shop-Test (jeden Shop einmal prüfen, Bericht per Telegram)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: restock-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Zustand (welche Angebote schon gemeldet wurden) zwischen den Läufen merken
+      - name: Zustand laden
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+
+      - name: Shops prüfen
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MAX_AUFSCHLAG_PROZENT: ${{ vars.MAX_AUFSCHLAG_PROZENT || '10' }}
+          REGION: ${{ vars.REGION || 'AT' }}
+          SPRACHEN: ${{ vars.SPRACHEN || (vars.REGION == 'EU' && 'de,en' || 'de') }}
+          CHF_FAKTOR: ${{ vars.CHF_FAKTOR || '1.0' }}
+          SHOP_TEST: ${{ inputs.shop_test && '1' || '0' }}
+          LOOP_MINUTES: ${{ github.event_name == 'schedule' && '30' || '0' }}
+          INTERVAL_SECONDS: "180"
+        run: python bot.py
+
+      - name: Zustand speichern
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}
